@@ -1,0 +1,8 @@
+#!/usr/bin/env python2
+
+# Stub script to import and run the podcatcher.
+
+from podcatcher import podcatcher
+
+pc = podcatcher.Podcatcher()
+pc.run()
