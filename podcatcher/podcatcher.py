@@ -24,6 +24,7 @@ class Config(object):
         if self.subscribe:
             self.latest = 1
 
+    # Parser for command line switches.
     def parseLine(self, config, value):
         try:
             if config.index(value):
@@ -31,6 +32,7 @@ class Config(object):
         except ValueError:
             return 0
 
+    # PArser for string arguments.
     def parseStringLine(self, config, value):
         for i in range(1, len(config)):
             if config[i] == '-s':
