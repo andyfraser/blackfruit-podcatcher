@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+
+import os, sys, feedparser, re, shutil, logging, logging.handlers, operator
+from datetime import datetime, timedelta
+from time import mktime
+
+class Config:
+    def __init__(self, config):
+        self.poddir = '/home/andy/podcatcher/'
+        self.conffile = self.poddir + 'podcatcher.conf'
+        self.cachedir = self.poddir + 'cache/'
+        self.logfile = self.poddir + 'log/podcatcher.log'
+        self.logsize = 65536
+        self.finaldir = '/home/andy/Media/Podcasts/'
+        self.runfile = self.poddir + 'podcatcher.run'
+        self.cron = self.parseLine(config, '--cron')
+        self.listonly = self.parseLine(config, '-l')
+
+    def parseLine(self, config, value):
+        try:
+            if config.index(value):
+                return True
+        except ValueError:
+            return False
+
+    def parseStringLine(self, config, value):
+        for i in range(1, len(config)):
+            if config[i] == value:
+                return config[i + 1]
+        return False
+
+class Podcatcher:
+    def __init__(self):
+        self.config = Config(sys.argv)
+        self.comments = []
+        self.feeds = self.loadFeeds()
+        self.logger = logging.getLogger()
+        self.logger.setLevel(logging.INFO)
+        logfile = logging.handlers.RotatingFileHandler(self.config.logfile, maxBytes = self.config.logsize, backupCount = 3)
+        logfile.setLevel(logging.INFO)
+        logfile.setFormatter(logging.Formatter('%(asctime)s: %(levelname)s: %(message)s', '%a, %d %b %Y - %I:%M:%S %p'))
+        self.logger.addHandler(logfile)
+
+    def loadFeeds(self):
+        feeds = []
+        try:
+            feedfile = open(self.config.conffile, 'r')
+        except Exception as e:
+            self.logger.error('Failed to open "%s" for reading.' % self.config.conffile)
+            raise e
+            return
+        for text in feedfile:
+            if len(text) <= 1:
+                continue
+            if text[0] == '#':
+                self.comments.append(text)
+                continue
+            (feedurl, feedname, days, active, lastupdated) = text.strip('\n').split('|')
+            feeds.append({'url': feedurl, 'name': feedname, 'days': int(days), 'active': int(active), 'date': datetime.strptime(lastupdated, '%Y-%m-%d %H:%M:%S')})
+        feedfile.close()
+        return feeds
+
+    def processFeeds(self):
+        for feed in self.feeds:
+            if feed['active'] == 0:
+                continue
+            latest = None
+            f = feedparser.parse(feed['url'])
+            self.logger.info('Processing %s.' % f.feed.title)
+            feed['name'] = f.feed.title
+            for entry in f.entries:
+                feedupdated = datetime.fromtimestamp(mktime(entry.updated_parsed))
+                if feedupdated > feed['date']:
+                    if not latest or feedupdated > latest:
+                        latest = feedupdated
+                    self.logger.info('Found "%s".' % entry.title)
+                    feeddir = self.config.finaldir + f.feed.title
+                    url = entry.enclosures[0].href
+                    filename = os.path.basename(url)
+                    fileext = os.path.splitext(filename)
+                    dlfilename = self.config.cachedir + filename
+                    showtag = f.feed.title.replace(' Video (large)', '')
+                    showtag = showtag.replace(' Video (HD)', '')
+                    showtag = showtag.replace(' (HD)', '')
+                    showtag = showtag.replace(' (Video-HI)', '')
+                    titletag = entry.title.replace('"', '\\"')
+                    epsearch = re.compile(' ([0-9]+):')
+                    epfulltag = epsearch.search(titletag).groups()[0]
+                    eptag = ''
+                    seasontag = ''
+                    desctag = entry.content[0].value.replace('"', '\\"')
+                    if len(epfulltag) < 3:
+                        seasontag = '1'
+                        eptag = str(int(epfulltag) + 1)
+                    else:
+                        seasontag = str(int(epfulltag[:-2]) + 1)
+                        eptag = str(int(epfulltag[-2:]) + 1)
+                    realfilename = feeddir + '/' + showtag + ' - s' + seasontag + 'e' + eptag + fileext[1]
+                    if os.path.exists(realfilename):
+                        self.logger.info('Already downloaded "%s".' % realfilename)
+                        continue
+                    cmd = '/usr/bin/wget -cq -O %s %s' % (dlfilename, url)
+                    self.logger.info('Downloading "%s".' % filename)
+                    r = os.system(cmd)
+                    self.logger.info('Downloaded.')
+                    if r == 0:
+                        cmd = '/usr/bin/mp4tags -song "%s" -show "%s" -type "tvshow" -season %s -episode %s -longdesc "%s" %s' % (titletag, showtag, seasontag, eptag, desctag, dlfilename)
+                        os.system(cmd)
+                        if not os.path.exists(feeddir):
+                            self.logger.info('Creating directory "%s".' % feeddir)
+                            os.makedirs(feeddir)
+                        self.logger.info('Moving "%s" to "%s".' % (dlfilename, realfilename))
+                        shutil.move(dlfilename, realfilename)
+                    else:
+                        self.logger.error('Something went wrong downloading "%s".' % filename)
+                        latest = None
+                else:
+                    break
+            if latest:
+                feed['date'] = latest
+        self.saveFeeds()
+
+    def saveFeeds(self):
+        try:
+            feedfile = open(self.config.conffile, 'w')
+        except Exception as e:
+            self.logger.error('Failed to open "%s" for saving.' % self.config.conffile)
+            return
+        for feed in self.feeds:
+            feedfile.write('%s|%s|%d|%d|%s\n' % (feed['url'], feed['name'], feed['days'], feed['active'], feed['date']))
+        for line in self.comments:
+            feedfile.write('%s' % line)
+        feedfile.close()
+
+    def cleanup(self):
+        self.logger.info('Cleaning up.')
+        for feed in self.feeds:
+            checkdir = self.config.finaldir + feed['name']
+            numdays = feed['days']
+            self.logger.info('Checking directory "%s" (delete after %d days).' % (checkdir, numdays))
+            if not os.path.exists(checkdir):
+                self.logger.error('Directory does not exist.')
+                continue
+            delta = datetime.now() - timedelta(days = numdays)
+            filenames = os.listdir(checkdir)
+            if len(filenames) < 1:
+                self.logger.info('Directory is empty. Deleting directory.')
+                try:
+                    os.rmdir(checkdir)
+                except Exception as e:
+                    self.logger.error('Failed to delete "%s" with error "%s".' % (checkdir, str(e)))
+            else:
+                for filename in filenames:
+                    fullpath = checkdir + '/' + filename
+                    if os.path.isfile(fullpath):
+                        filetime = datetime.fromtimestamp(os.path.getmtime(fullpath))
+                        daysleft = filetime - delta
+                        self.logger.info('Found "%s". %s until delete.' % (filename, str(daysleft).split(',')[0]))
+                        if filetime < delta:
+                            self.logger.info('Deleting "%s".' % filename)
+                            try:
+                                os.remove(fullpath)
+                            except Exception as e:
+                                self.logger.error('Failed to delete "%s" with error "%s".' % (filename, str(e)))
+
+    def listFeeds(self):
+        byname = sorted(self.feeds, key=operator.itemgetter('name'))
+        result = sorted(byname, key=operator.itemgetter('date'), reverse=True)
+        print('Feeds last updated:\n')
+        for feed in result:
+            print('%s %s' % ('{:<30}'.format(feed['name'].replace(' Video (large)', '')), feed['date'].strftime('%I:%M %p, %d %B %Y')))
+
+p = Podcatcher()
+
+#if datetime.now().hour in (11, 12, 13, 14, 17, 18, 19, 20, 21) and not p.config.listonly:
+#    sys.exit(2)
+
+if os.path.exists(p.config.runfile):
+    sys.exit(1)
+if p.config.listonly:
+    p.listFeeds()
+    sys.exit()
+try:
+    f = open(p.config.runfile, 'w')
+    f.close()
+    p.logger.info('Podcatcher started.')
+    p.processFeeds()
+    p.cleanup()
+finally:
+    p.logger.info('Podcatcher finished.')
+    if os.path.exists(p.config.runfile):
+        os.remove(p.config.runfile)
+sys.exit()
